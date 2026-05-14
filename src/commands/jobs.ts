@@ -926,15 +926,28 @@ HANDLER TYPES (built in)
       const cliPath = parseFlag(args, '--cli-path') ?? resolveGbrainCliPath();
 
       // --detach: fork a background supervisor, print PID payload, exit 0.
-      // Implementation: re-exec the same CLI as a detached child without --detach,
-      // inheriting stderr (so JSONL events still flow to the parent's tail-f
-      // if they wanted to follow logs) but detaching stdin/stdout.
+      // Implementation: re-exec the same CLI as a detached child without --detach.
+      //
+      // v0.33.3: stderr goes to a log file instead of 'inherit'. The old
+      // 'inherit' mode shared the parent's stderr fd with the detached child.
+      // When the parent was an ephemeral process (e.g. an AI agent's exec
+      // session), its stderr was a pipe/socket that closed on cleanup —
+      // causing SIGPIPE (exit 141) in the long-lived supervisor and a rapid
+      // crash cascade (10 exits in <5 min → max_crashes_exceeded).
       if (detach) {
         const { spawn } = await import('child_process');
+        const { openSync, mkdirSync } = await import('fs');
+        const { dirname } = await import('path');
+
+        // Log next to the PID file: ~/.gbrain/supervisor.log
+        const logPath = pidFile.replace(/\.pid$/, '.log');
+        mkdirSync(dirname(logPath), { recursive: true });
+        const logFd = openSync(logPath, 'a');
+
         const childArgs = process.argv.slice(2).filter(a => a !== '--detach');
         const child = spawn(process.execPath, [process.argv[1], ...childArgs], {
           detached: true,
-          stdio: ['ignore', 'ignore', 'inherit'],
+          stdio: ['ignore', logFd, logFd],
           env: process.env,
         });
         child.unref();
@@ -942,6 +955,7 @@ HANDLER TYPES (built in)
           event: 'started',
           supervisor_pid: child.pid,
           pid_file: pidFile,
+          log_file: logPath,
           detached: true,
         };
         console.log(JSON.stringify(payload));
