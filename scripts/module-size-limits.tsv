@@ -25,6 +25,7 @@ src/commands/embed.ts	2046	ratchet	grown v0.46.25.0 delegated wave (#3971)
 src/core/types.ts	1882	ratchet	grown v0.46.22.0 phone wave: supersession rerank result fields + effective-date page filters (#4056 #4389)
 src/commands/skillpack.ts	1360	ratchet
 src/core/minions/queue.ts	2138	ratchet	grown by #4078 subagent-loop capability fix
+src/core/schema-embedded.ts	1501	ratchet	generated schema bundle grew for private queue metadata
 src/commands/init.ts	1950	ratchet	grown v0.46.x keyless capability notices
 src/commands/integrations.ts	1733	ratchet	grown v0.46.24.0 overnight wave (#3588)
 src/core/minions/handlers/subagent.ts	1825	ratchet	merged: master v131 settle rework + dream-wave C5 peel + C6 accounting + C7 lease heartbeats/lost-lease aborts + C9 oneshot dispatch + adversarial fix batches; grown by #4078 subagent-loop capability fix
