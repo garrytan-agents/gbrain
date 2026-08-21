@@ -23,6 +23,7 @@ import {
   resolvePriority,
   newestCommitMs,
   lagFromContentMs,
+  isImmutableSourceConfig,
   resolveStalenessCeilingSeconds,
   _resetPriorityWarningsForTest,
 } from '../src/core/source-health.ts';
@@ -195,6 +196,62 @@ describe('lagFromContentMs (pure remote/column comparator)', () => {
   });
   test('content after last sync → wall-clock since sync', () => {
     expect(lagFromContentMs(now - 10 * HOUR, now - 100 * HOUR, now)).toBe(360_000);
+  });
+
+  // ── #4332 follow-up: immutable dated snapshots (camera-roll-2026-08-13) ──
+  //
+  // The ramp treats "nobody looked recently" as a defect. For a write-once
+  // dated snapshot that is false: content can never change, so the alarm can
+  // never be cleared by syncing and just re-fires forever.
+  test('immutable source: caught-up past the ceiling does NOT ramp', () => {
+    const ceiling = 72 * 3600;
+    // Same inputs as the ramp test above, which returns 28h of lag.
+    expect(lagFromContentMs(now - 200 * HOUR, now - 100 * HOUR, now, ceiling)).toBe(28 * 3600);
+    // Declared immutable → permanently caught up, no escalation.
+    expect(
+      lagFromContentMs(now - 200 * HOUR, now - 100 * HOUR, now, ceiling, { immutable: true }),
+    ).toBe(0);
+  });
+  test('immutable source: stays 0 no matter how much time passes', () => {
+    const ceiling = 72 * 3600;
+    // Content must stay OLDER than last_sync for this to be the caught-up
+    // branch — a snapshot imported long before every sync of it. (If the
+    // content timestamp were newer than last_sync the source is genuinely
+    // behind, and the test below pins that it still reports wall-clock.)
+    const at = (h: number) =>
+      lagFromContentMs(now - (h + 1) * HOUR, now - h * HOUR, now, ceiling, { immutable: true });
+    expect(at(100)).toBe(0);
+    expect(at(1000)).toBe(0);
+    expect(at(10_000)).toBe(0);
+  });
+  test('immutable does NOT suppress genuinely newer content (no blanket mute)', () => {
+    // Content NEWER than last sync is real, actionable staleness even on a
+    // source someone mislabelled immutable. Must still report wall-clock.
+    expect(
+      lagFromContentMs(now - 10 * HOUR, now - 100 * HOUR, now, 72 * 3600, { immutable: true }),
+    ).toBe(360_000);
+  });
+  test('immutable does NOT suppress the never-synced / no-content-signal path', () => {
+    // No stored content signal → wall-clock fallback regardless of the flag,
+    // so a source with no evidence is never silently marked healthy.
+    expect(
+      lagFromContentMs(null, now - 100 * HOUR, now, 72 * 3600, { immutable: true }),
+    ).toBe(360_000);
+    // Unknown last sync is still null (caller reports "never synced").
+    expect(lagFromContentMs(now - HOUR, null, now, 72 * 3600, { immutable: true })).toBeNull();
+  });
+  test('immutable does NOT suppress clock-skew passthrough', () => {
+    expect(lagFromContentMs(now, now + 10_000, now, 72 * 3600, { immutable: true })).toBe(-10);
+  });
+  test('isImmutableSourceConfig is strict — only boolean true opts out', () => {
+    expect(isImmutableSourceConfig({ immutable: true })).toBe(true);
+    // A truthy string/number must NOT silently disable a staleness alarm.
+    expect(isImmutableSourceConfig({ immutable: 'true' })).toBe(false);
+    expect(isImmutableSourceConfig({ immutable: 1 })).toBe(false);
+    expect(isImmutableSourceConfig({ immutable: false })).toBe(false);
+    expect(isImmutableSourceConfig({})).toBe(false);
+    expect(isImmutableSourceConfig(null)).toBe(false);
+    expect(isImmutableSourceConfig(undefined)).toBe(false);
   });
   test('GBRAIN_STALENESS_CEILING_HOURS overrides GBRAIN_SYNC_FRESHNESS_FAIL_HOURS', async () => {
     await withEnv(

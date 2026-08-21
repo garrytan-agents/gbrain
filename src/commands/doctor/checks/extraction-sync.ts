@@ -10,7 +10,8 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import { probeSourceGitState } from '../../../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
-import { lagFromContentMs, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
+import { lagFromContentMs, resolveStalenessCeilingSeconds, isImmutableSourceConfig } from '../../../core/source-health.ts';
+import { parseSourceConfig } from '../../../core/sources-load.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
 import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../../../core/link-extraction.ts';
@@ -696,10 +697,12 @@ export async function checkSyncFreshness(
       last_commit: string | null;
       chunker_version: string | null;
       newest_content_at: Date | null;
+      config: Record<string, unknown> | string | null;
     }>(
       // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
       // doctorReportRemote never shells out to git on a DB-supplied local_path.
-      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+      // config carries the #4332 `immutable` declaration (no new column).
+      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL`,
     );
 
     if (sources.length === 0) {
@@ -915,6 +918,9 @@ export async function checkSyncFreshness(
           lastSync,
           now,
           stalenessCeilingSeconds,
+          // #4332 follow-up: an immutable dated snapshot (camera-roll-2026-08-13)
+          // is permanently caught up by construction; suppress only the ramp.
+          { immutable: isImmutableSourceConfig(parseSourceConfig(source.config)) },
         );
         thresholdAgeMs = lagSec === null ? ageMs : lagSec * 1000;
       }

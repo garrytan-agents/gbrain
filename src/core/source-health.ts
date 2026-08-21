@@ -218,24 +218,51 @@ export function resolveStalenessCeilingSeconds(): number {
  * The LOCAL path does NOT use this — it keys off the live commit hash via
  * `isSourceUnchangedSinceSync` (robust against HEAD moving to an old-dated
  * commit, which a timestamp comparison would miss).
+ *
+ * IMMUTABLE SOURCES (#4332 follow-up, the camera-roll-2026-08-13 bug):
+ *
+ *   The ramp assumes "nobody has looked in a long time" is a defect worth
+ *   escalating. That is false for a dated, write-once snapshot
+ *   (`camera-roll-2026-08-13`, an archival import of one day's photos). Its
+ *   content can never change, so re-syncing it can never clear the alarm —
+ *   the ramp just re-fires forever and trains operators to ignore the check.
+ *   `opts.immutable` suppresses ONLY the caught-up ramp: the source still
+ *   reports full wall-clock lag the moment `newest_content_at` shows content
+ *   NEWER than the last sync, and a source with no content signal at all
+ *   still falls through to wall-clock. So a real regression is never hidden —
+ *   only "caught up and by definition staying that way" stops escalating.
  */
 export function lagFromContentMs(
   contentMs: number | null,
   lastSyncMs: number | null,
   nowMs: number,
   ceilingSeconds: number = resolveStalenessCeilingSeconds(),
+  opts: { immutable?: boolean } = {},
 ): number | null {
   if (lastSyncMs === null || !Number.isFinite(lastSyncMs)) return null;
   const wallClockSeconds = Math.floor((nowMs - lastSyncMs) / 1000);
   if (wallClockSeconds < 0) return wallClockSeconds; // clock skew passthrough
   if (contentMs !== null && Number.isFinite(contentMs)) {
     // Caught up: 0 while recently checked, then ramp once nobody has looked
-    // for longer than the ceiling.
-    return contentMs <= lastSyncMs
-      ? Math.max(0, wallClockSeconds - ceilingSeconds)
-      : wallClockSeconds;
+    // for longer than the ceiling — unless the source is declared immutable,
+    // in which case caught-up is the permanent, correct steady state.
+    if (contentMs <= lastSyncMs) {
+      return opts.immutable === true ? 0 : Math.max(0, wallClockSeconds - ceilingSeconds);
+    }
+    return wallClockSeconds;
   }
   return wallClockSeconds; // no stored content signal — wall-clock fallback
+}
+
+/**
+ * Read the per-source immutability declaration from `sources.config`.
+ *
+ * Stored in the existing free-form config JSON (`{"immutable": true}`) so this
+ * needs no migration and no new column. Deliberately strict `=== true`: a
+ * truthy string or 1 must NOT silently disable a staleness alarm.
+ */
+export function isImmutableSourceConfig(config: Record<string, unknown> | null | undefined): boolean {
+  return config?.immutable === true;
 }
 
 /**
@@ -319,7 +346,11 @@ export async function computeAllSourceMetrics(
       const contentMs = src.newest_content_at
         ? new Date(src.newest_content_at).getTime()
         : null;
-      lagSeconds = lagFromContentMs(contentMs, lastMs, now, stalenessCeilingSeconds);
+      lagSeconds = lagFromContentMs(contentMs, lastMs, now, stalenessCeilingSeconds, {
+        // #4332 follow-up: immutable dated snapshots stay caught-up forever by
+        // construction; only the time-based ramp is suppressed.
+        immutable: isImmutableSourceConfig(cfg),
+      });
     }
 
     return {

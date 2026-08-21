@@ -8,7 +8,7 @@ import { loadConfig } from './config.ts';
 import { unacknowledgedSyncFailures } from './sync.ts';
 // lagFromContentMs is the remote/column comparator (buildSyncStatusReport
 // backs the get_status_snapshot MCP op — must NOT shell out to git).
-import { lagFromContentMs } from './source-health.ts';
+import { lagFromContentMs, isImmutableSourceConfig } from './source-health.ts';
 
 /**
  * v0.40.3.0 — read-only per-source dashboard for `gbrain sources status`.
@@ -207,6 +207,9 @@ export async function buildSyncStatusReport(
   const now = Date.now();
   const out: SyncStatusReportSource[] = sources.map((src) => {
     const cfgEntry = (src.config || {}) as { syncEnabled?: boolean };
+    // #4332 follow-up: a dated write-once snapshot never escalates on the
+    // caught-up ramp (see lagFromContentMs). Newer content still reports lag.
+    const immutable = isImmutableSourceConfig(src.config as Record<string, unknown> | undefined);
     const row = sourceMap.get(src.id) || { id: src.id, last_commit: null, last_sync_at: null, newest_content_at: null };
     const counts = countMap.get(src.id) || { pages: 0, chunks_total: 0, chunks_unembedded: 0 };
     const lastSyncMs = row.last_sync_at
@@ -223,6 +226,8 @@ export async function buildSyncStatusReport(
       Number.isFinite(contentMs as number) ? (contentMs as number) : null,
       lastSyncMs !== null && Number.isFinite(lastSyncMs) ? lastSyncMs : null,
       now,
+      undefined,
+      { immutable },
     );
     const stalenessHours = lagSeconds === null ? null : lagSeconds / 3600;
     const hoursSinceLastSync = lastSyncMs !== null && Number.isFinite(lastSyncMs)
