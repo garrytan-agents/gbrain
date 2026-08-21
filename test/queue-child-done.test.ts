@@ -13,8 +13,25 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { hostname } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
+
+/**
+ * A PID that is provably dead on this host. Probing upward from a high base
+ * keeps the search off live processes; the recovery path treats ESRCH (and
+ * only ESRCH, past the reuse grace) as reclaimable.
+ */
+const DEAD_PID = (() => {
+  for (let pid = 4_194_300; pid > 4_000_000; pid--) {
+    try {
+      process.kill(pid, 0);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ESRCH') return pid;
+    }
+  }
+  throw new Error('could not find a dead PID for the test');
+})();
 import type { ChildDoneMessage } from '../src/core/minions/types.ts';
 
 let engine: PGLiteEngine;
@@ -255,7 +272,7 @@ describe('private queue terminal reconciliation', () => {
     await expect(queue.reconcilePrivateQueue('default', 'bad target')).rejects.toThrow('refusing to reconcile non-private queue');
   });
 
-  test('startup recovery cancels an ownerless private queue only after its lease expires', async () => {
+  test('startup recovery cancels an ownerless private queue once its lease expires AND its owner process is gone', async () => {
     const privateQueue = `dream-inline-${Date.now()}-expired1`;
     const token = 'ownerless-expired';
     const job = await queue.add('private-waiting', {}, {
@@ -263,9 +280,17 @@ describe('private queue terminal reconciliation', () => {
       private_queue_owner_token: token,
       private_queue_lease_ms: 600_000,
     });
+    // Expire the lease AND point the owner identity at a dead PID on this
+    // host, aged past the PID-reuse grace. Both are required now: an expired
+    // lease alone must never be enough (see the test below).
     await engine.executeRaw(
-      `UPDATE minion_jobs SET private_queue_lease_until = now() - interval '1 second' WHERE id = $1`,
-      [job.id],
+      `UPDATE minion_jobs
+          SET private_queue_lease_until = now() - interval '1 second',
+              private_queue_owner_pid = $2,
+              private_queue_owner_host = $3,
+              created_at = now() - interval '2 hours'
+        WHERE id = $1`,
+      [job.id, DEAD_PID, hostname()],
     );
 
     const first = await queue.reconcileOrphanedPrivateQueues({ reason: 'test startup recovery' });
@@ -277,6 +302,120 @@ describe('private queue terminal reconciliation', () => {
     const second = await queue.reconcileOrphanedPrivateQueues({ reason: 'second pass' });
     expect(second.cancelled_jobs).toBe(0);
     expect(second.cancelled_queues).toBe(0);
+  });
+
+  // ── the live-cancellation regression this pass exists to prevent ────────
+  //
+  // The lease only renews while a child handler is executing (inline-drain's
+  // 60s keepalive). A slow gap between children, or a long post-drain
+  // collection, can lapse it under a perfectly healthy owner — and
+  // owner_job_id is NULL for every CLI `gbrain dream` run, so the lease was
+  // the ONLY guard. Recovery must probe the owning process before cancelling.
+  test('startup recovery does NOT cancel an expired-lease queue whose owner process is still alive', async () => {
+    const privateQueue = `dream-inline-${Date.now()}-livepid`;
+    const job = await queue.add('private-waiting', {}, {
+      queue: privateQueue,
+      private_queue_owner_token: 'live-process',
+      private_queue_lease_ms: 600_000,
+    });
+    // add() stamps this process's host/pid; expire only the lease.
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET private_queue_lease_until = now() - interval '1 hour' WHERE id = $1`,
+      [job.id],
+    );
+    const stamped = await queue.getJob(job.id);
+    expect(stamped?.private_queue_owner_pid).toBe(process.pid);
+    expect(stamped?.private_queue_owner_host).toBe(hostname());
+
+    const result = await queue.reconcileOrphanedPrivateQueues({ reason: 'must not fire' });
+    expect(result.cancelled_jobs).toBe(0);
+    expect(result.skipped_live_queues).toBeGreaterThanOrEqual(1);
+    expect((await queue.getJob(job.id))?.status).toBe('waiting');
+  });
+
+  test('startup recovery does NOT cancel an expired-lease queue owned by another host', async () => {
+    // Cross-host PIDs are unprobeable; process.kill would be meaningless.
+    const privateQueue = `dream-inline-${Date.now()}-otherhost`;
+    const job = await queue.add('private-waiting', {}, {
+      queue: privateQueue,
+      private_queue_owner_token: 'remote-owner',
+      private_queue_lease_ms: 600_000,
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET private_queue_lease_until = now() - interval '1 hour',
+              private_queue_owner_pid = $2,
+              private_queue_owner_host = 'some-other-machine',
+              created_at = now() - interval '2 hours'
+        WHERE id = $1`,
+      [job.id, DEAD_PID],
+    );
+
+    const result = await queue.reconcileOrphanedPrivateQueues({ reason: 'must not fire cross-host' });
+    expect(result.cancelled_jobs).toBe(0);
+    expect((await queue.getJob(job.id))?.status).toBe('waiting');
+  });
+
+  // ── legacy (pre-#4332) unowned queues: adopt, never cancel ──────────────
+  test('legacy adoption is OFF by default — unowned queues are left untouched', async () => {
+    const privateQueue = `dream-inline-${Date.now()}-legacyoff`;
+    const job = await queue.add('private-waiting', {}, { queue: privateQueue });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET created_at = now() - interval '30 days', updated_at = now() - interval '30 days' WHERE id = $1`,
+      [job.id],
+    );
+
+    const result = await queue.reconcileOrphanedPrivateQueues();
+    expect(result.adopted_legacy_queues).toBe(0);
+    expect(result.skipped_unowned_queues).toBeGreaterThanOrEqual(1);
+    expect((await queue.getJob(job.id))?.status).toBe('waiting');
+  });
+
+  test('legacy adoption stamps ownership instead of cancelling, and never terminalizes', async () => {
+    const privateQueue = `dream-inline-${Date.now()}-legacyadopt`;
+    const job = await queue.add('private-waiting', {}, { queue: privateQueue });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET created_at = now() - interval '30 days', updated_at = now() - interval '30 days' WHERE id = $1`,
+      [job.id],
+    );
+
+    const result = await queue.reconcileOrphanedPrivateQueues({ adoptLegacyUnowned: true });
+    expect(result.adopted_legacy_queues).toBeGreaterThanOrEqual(1);
+    expect(result.cancelled_jobs).toBe(0);
+
+    // Still live work, now carrying a token + lease so the normal rules apply.
+    const after = await queue.getJob(job.id);
+    expect(after?.status).toBe('waiting');
+    expect(after?.private_queue_owner_token).toStartWith('legacy-adopted-');
+    expect(after?.private_queue_lease_until).not.toBeNull();
+  });
+
+  test('legacy adoption refuses a queue that is younger than the age gate', async () => {
+    const privateQueue = `dream-inline-${Date.now()}-legacyyoung`;
+    const job = await queue.add('private-waiting', {}, { queue: privateQueue });
+
+    const result = await queue.reconcileOrphanedPrivateQueues({ adoptLegacyUnowned: true });
+    expect(result.adopted_legacy_queues).toBe(0);
+    expect((await queue.getJob(job.id))?.private_queue_owner_token).toBeNull();
+  });
+
+  test('legacy adoption refuses a queue with a healthy active child lock', async () => {
+    const privateQueue = `dream-inline-${Date.now()}-legacybusy`;
+    const job = await queue.add('private-busy', {}, { queue: privateQueue });
+    const claimed = await queue.claim(nextToken(), 30_000, privateQueue, ['private-busy']);
+    expect(claimed?.id).toBe(job.id);
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET created_at = now() - interval '30 days', updated_at = now() - interval '30 days' WHERE id = $1`,
+      [job.id],
+    );
+
+    const adopted = await queue.adoptLegacyPrivateQueue(privateQueue);
+    expect(adopted).toBe(false);
+    expect((await queue.getJob(job.id))?.private_queue_owner_token).toBeNull();
+  });
+
+  test('refuses to adopt a shared queue', async () => {
+    await expect(queue.adoptLegacyPrivateQueue('default')).rejects.toThrow('refusing to adopt non-private queue');
   });
 
   test('startup recovery never cancels a private queue with a future lease', async () => {

@@ -934,6 +934,8 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   private_queue_owner_job_id INTEGER REFERENCES minion_jobs(id) ON DELETE SET NULL,
   private_queue_owner_token TEXT,
   private_queue_lease_until TIMESTAMPTZ,
+  private_queue_owner_host TEXT,
+  private_queue_owner_pid INTEGER,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   started_at       TIMESTAMPTZ,
   finished_at      TIMESTAMPTZ,

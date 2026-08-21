@@ -82,6 +82,10 @@ export interface MinionJob {
   private_queue_owner_token: string | null;
   /** Renewable private-queue lease. Startup recovery may cancel only after this expires. */
   private_queue_lease_until: Date | null;
+  /** Host of the process that owns this private queue (liveness probe scope). */
+  private_queue_owner_host: string | null;
+  /** PID of the process that owns this private queue; probed before any recovery. */
+  private_queue_owner_pid: number | null;
 
   // v12: scheduler polish — quiet-hours gate + deterministic stagger
   quiet_hours: Record<string, unknown> | null;
@@ -153,6 +157,13 @@ export interface MinionJobInput {
   private_queue_owner_job_id?: number | null;
   private_queue_owner_token?: string | null;
   private_queue_lease_ms?: number | null;
+  /**
+   * Owning process identity. Defaults to the submitting process when a private
+   * queue owner token is supplied, so a CLI dream run (which has no owner JOB)
+   * still carries a probe-able liveness signal.
+   */
+  private_queue_owner_host?: string | null;
+  private_queue_owner_pid?: number | null;
   /** Submission backpressure: cap waiting jobs with this name before inserting
    *  a new row. Scope is (name, queue, source), where source reads
    *  data.sourceId ?? data.source_id; a submission with NO source key counts
@@ -471,6 +482,8 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     private_queue_owner_job_id: (row.private_queue_owner_job_id as number | null) ?? null,
     private_queue_owner_token: (row.private_queue_owner_token as string) || null,
     private_queue_lease_until: row.private_queue_lease_until ? new Date(row.private_queue_lease_until as string) : null,
+    private_queue_owner_host: (row.private_queue_owner_host as string) || null,
+    private_queue_owner_pid: (row.private_queue_owner_pid as number | null) ?? null,
     quiet_hours: row.quiet_hours ? (typeof row.quiet_hours === 'string' ? JSON.parse(row.quiet_hours) : row.quiet_hours) as Record<string, unknown> : null,
     stagger_key: (row.stagger_key as string) || null,
     result: row.result ? (typeof row.result === 'string' ? JSON.parse(row.result) : row.result) as Record<string, unknown> : null,

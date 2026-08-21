@@ -468,6 +468,15 @@ export const ExitCodes = {
 // via the DB lock instead of the (possibly split-$HOME) pidfile.
 export const SUPERVISOR_LOCK_TTL_MIN = 5;
 const SUPERVISOR_LOCK_REFRESH_MS = 60_000;
+
+/**
+ * Floor between pre-spawn private-queue recovery scans (#4332). The first
+ * spawn after supervisor start always scans; a crash-loop respawning faster
+ * than this reuses the previous pass rather than re-scanning every dream-inline
+ * row. Orphan recovery is not latency-sensitive — the delayed backstops
+ * (waiting-TTL, Doctor) still cover anything this defers.
+ */
+const PRIVATE_QUEUE_RECOVERY_MIN_INTERVAL_MS = 60_000;
 const SUPERVISOR_LOCK_REFRESH_MAX_FAILURES = 3; // 3 × 60s = 180s < 5min TTL
 
 /**
@@ -524,6 +533,8 @@ export class MinionSupervisor {
   /** Path to tini binary for zombie reaping, or empty string when absent. */
   private readonly tiniPath: string;
   private stopping = false;
+  /** Throttle stamp for pre-spawn private-queue recovery; null = never run. */
+  private lastPrivateQueueRecoveryAtMs: number | null = null;
   private healthInFlight = false;
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private exitListener: (() => void) | null = null;
@@ -791,6 +802,19 @@ export class MinionSupervisor {
   }
 
   private async reconcileOrphanedPrivateQueuesBeforeWorkerSpawn(): Promise<void> {
+    // Runs before EVERY spawn (including crash/watchdog respawns) because those
+    // are exactly the exits that strand a parent-owned queue. A crash-loop can
+    // fire this many times per minute, though, and the scan touches every
+    // non-terminal dream-inline row — so throttle repeat passes while still
+    // guaranteeing one scan on the first spawn after supervisor start.
+    const now = Date.now();
+    if (
+      this.lastPrivateQueueRecoveryAtMs !== null &&
+      now - this.lastPrivateQueueRecoveryAtMs < PRIVATE_QUEUE_RECOVERY_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastPrivateQueueRecoveryAtMs = now;
     try {
       const result = await new MinionQueue(this.engine).reconcileOrphanedPrivateQueues({
         reason: 'supervisor startup recovery: orphaned dream-inline private queue',

@@ -11,21 +11,21 @@ src/core/migrate.ts	668	region-exempt	append-only MIGRATIONS array grows freely;
 src/commands/sync.ts	4334	ratchet	grown v0.46.25.0 fix waves: delete-slug resolver + msys healing (#3942 #2955)
 src/core/ai/gateway.ts	4441	ratchet	grown v0.46.25.0 D2: env-key snapshot stash (#2119)
 src/cli.ts	3628	ratchet	grown v0.46.25.0 D2: stdout interposer install (#4383)
-src/core/cycle.ts	3099	ratchet	grown v0.46.25.0 fix waves: refresher abort gating + keyless honesty (#4309 #2821) | signal feature-detect (#4309 handler shape)
+src/core/cycle.ts	3103	ratchet	grown v0.46.25.0 fix waves: refresher abort gating + keyless honesty (#4309 #2821) | signal feature-detect (#4309 handler shape); private queue owner id threading (#4332)
 src/commands/serve-http.ts	3294	ratchet	grown v0.46.25.0 D2: /mcp per-request teardown (#2844)
-src/commands/jobs.ts	3041	ratchet	grown v0.46.25.0 fix waves: jobs list/get --json (#3685)
+src/commands/jobs.ts	3043	ratchet	grown v0.46.25.0 fix waves: jobs list/get --json (#3685); private queue owner id threading (#4332)
 src/core/search/hybrid.ts	2703	ratchet	grown v0.46.25.0 fix waves: cache scope isolation + pool floor + offset bypass (#3871 #3002)
 src/core/engine.ts	2415	ratchet	grown v0.46.25.0 fix waves: timeline dedup contract + registry write contract (#3827 #1262)
 src/commands/autopilot.ts	2349	ratchet	grown v0.46.25.0 fix waves: positional validation (#1525) + liveness takeover (#4300)
 src/commands/extract.ts	2066	ratchet	lowered: timeline extractor hoisted to core/timeline-extract.ts (module-cycle fix)
 src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provider gateway-unavailable copy
 src/core/import-file.ts	2016	ratchet	grown v0.46.24.0 overnight wave: embedding_plane_split named error (#4287)
-src/core/cycle/synthesize.ts	2702	ratchet	merged: five-issue wave + dream-wave C7 peel + C8 manifest + C9 mode/telemetry/backfill + adversarial fix batches
+src/core/cycle/synthesize.ts	2719	ratchet	merged: five-issue wave + dream-wave C7 peel + C8 manifest + C9 mode/telemetry/backfill + adversarial fix batches; private queue lease renewal + finally-path reconcile (#4332)
 src/commands/embed.ts	2046	ratchet	grown v0.46.25.0 delegated wave (#3971)
 src/core/types.ts	1882	ratchet	grown v0.46.22.0 phone wave: supersession rerank result fields + effective-date page filters (#4056 #4389)
 src/commands/skillpack.ts	1360	ratchet
-src/core/minions/queue.ts	2138	ratchet	grown by #4078 subagent-loop capability fix
-src/core/schema-embedded.ts	1501	ratchet	generated schema bundle grew for private queue metadata
+src/core/minions/queue.ts	2468	ratchet	grown by #4078 subagent-loop capability fix; private-queue owner/lease/pid metadata + orphan startup recovery + legacy adoption (#4332)
+src/core/schema-embedded.ts	1506	ratchet	generated schema bundle grew for private queue owner metadata (#4332)
 src/commands/init.ts	1950	ratchet	grown v0.46.x keyless capability notices
 src/commands/integrations.ts	1733	ratchet	grown v0.46.24.0 overnight wave (#3588)
 src/core/minions/handlers/subagent.ts	1825	ratchet	merged: master v131 settle rework + dream-wave C5 peel + C6 accounting + C7 lease heartbeats/lost-lease aborts + C9 oneshot dispatch + adversarial fix batches; grown by #4078 subagent-loop capability fix

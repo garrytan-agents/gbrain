@@ -8,7 +8,10 @@
  *   await queue.prune({ olderThan: new Date(Date.now() - 30 * 86400000) });
  */
 
+import { hostname } from 'os';
+import { randomUUID } from 'crypto';
 import type { BrainEngine } from '../engine.ts';
+import { classifyHolderLiveness } from '../db-lock.ts';
 import type {
   MinionJob, MinionJobInput, MinionJobStatus, InboxMessage, TokenUpdate,
   MinionQueueOpts, ChildDoneMessage, ChildOutcome, Attachment, AttachmentInput,
@@ -123,7 +126,17 @@ export interface PrivateQueueRecoveryResult {
   skipped_live_queues: number;
   skipped_unowned_queues: number;
   skipped_non_orphan_queues: number;
+  /** Legacy unowned queues stamped with adoption metadata this pass. */
+  adopted_legacy_queues: number;
 }
+
+/**
+ * Minimum age before a legacy (pre-#4332) unowned `dream-inline-*` queue may be
+ * ADOPTED into the metadata regime. Generous by construction: adoption is a
+ * one-way stamp that starts a lease clock, and a queue younger than this could
+ * still belong to an owner that simply predates the owner-stamping build.
+ */
+export const LEGACY_PRIVATE_QUEUE_ADOPTION_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 
 /** Audit payload deferred from inside the submission transaction. */
 type CoalesceAuditEvent = {
@@ -572,11 +585,12 @@ export class MinionQueue {
       const baseCols = `name, queue, status, priority, data, max_attempts, backoff_type,
             backoff_delay, backoff_jitter, delay_until, parent_job_id, on_child_fail,
             depth, max_children, timeout_ms, lock_duration_ms, remove_on_complete, remove_on_fail, idempotency_key,
-            quiet_hours, stagger_key, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until`;
+            quiet_hours, stagger_key, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until,
+            private_queue_owner_host, private_queue_owner_pid`;
       const baseVals = `$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21`;
-      const baseValsWithOwner = `${baseVals}, $22, $23, $24`;
+      const baseValsWithOwner = `${baseVals}, $22, $23, $24, $25, $26`;
       const cols = hasMaxStalled ? `${baseCols}, max_stalled` : baseCols;
-      const vals = hasMaxStalled ? `${baseValsWithOwner}, $25` : baseValsWithOwner;
+      const vals = hasMaxStalled ? `${baseValsWithOwner}, $27` : baseValsWithOwner;
 
       const insertSql = opts?.idempotency_key
         ? `INSERT INTO minion_jobs (${cols})
@@ -622,6 +636,15 @@ export class MinionQueue {
         opts?.private_queue_owner_job_id ?? null,
         opts?.private_queue_owner_token ?? null,
         privateQueueLeaseUntil,
+        // Stamp the submitting process when this row carries private-queue
+        // ownership. owner_job_id is NULL for CLI dream runs, so this is the
+        // only liveness signal recovery can probe for that (common) shape.
+        opts?.private_queue_owner_token
+          ? (opts?.private_queue_owner_host ?? hostname())
+          : (opts?.private_queue_owner_host ?? null),
+        opts?.private_queue_owner_token
+          ? (opts?.private_queue_owner_pid ?? process.pid)
+          : (opts?.private_queue_owner_pid ?? null),
       ];
       if (hasMaxStalled) params.push(clampedMaxStalled);
 
@@ -815,6 +838,17 @@ export class MinionQueue {
   async reconcileOrphanedPrivateQueues(opts: {
     reason?: string;
     maxQueues?: number;
+    /**
+     * Opt-in migration for legacy pre-#4332 queues that carry NO owner
+     * metadata. When enabled, a sufficiently old unowned queue is *adopted* —
+     * stamped with an owner token and a fresh lease — instead of being
+     * cancelled. Adoption never terminalizes a job: the next pass evaluates it
+     * under the normal liveness rules, and a still-live owner keeps renewing.
+     * Default OFF so a plain supervisor start never mutates legacy rows.
+     */
+    adoptLegacyUnowned?: boolean;
+    /** @internal test seam for the adoption age gate. */
+    legacyAdoptionMinAgeMs?: number;
   } = {}): Promise<PrivateQueueRecoveryResult> {
     const result: PrivateQueueRecoveryResult = {
       scanned_queues: 0,
@@ -823,6 +857,7 @@ export class MinionQueue {
       skipped_live_queues: 0,
       skipped_unowned_queues: 0,
       skipped_non_orphan_queues: 0,
+      adopted_legacy_queues: 0,
     };
     const maxQueues = Math.max(1, Math.floor(opts.maxQueues ?? 100));
     const queues = await this.engine.executeRaw<{ queue: string }>(
@@ -843,6 +878,16 @@ export class MinionQueue {
         continue;
       }
       if (verdict === 'unowned') {
+        if (opts.adoptLegacyUnowned) {
+          const adopted = await this.adoptLegacyPrivateQueue(
+            q.queue,
+            opts.legacyAdoptionMinAgeMs ?? LEGACY_PRIVATE_QUEUE_ADOPTION_MIN_AGE_MS,
+          );
+          if (adopted) {
+            result.adopted_legacy_queues++;
+            continue;
+          }
+        }
         result.skipped_unowned_queues++;
         continue;
       }
@@ -862,6 +907,69 @@ export class MinionQueue {
     return result;
   }
 
+  /**
+   * Migration path for legacy pre-#4332 `dream-inline-*` queues that carry no
+   * owner metadata at all.
+   *
+   * Deliberately NOT a cancellation. Adoption only stamps an owner token plus
+   * a lease onto rows that are already old enough that no in-flight phase can
+   * plausibly own them, which brings them under the normal recovery rules
+   * without ever terminalizing work. Two guards keep a live queue safe:
+   *   - an age gate (default 24h) evaluated on the queue's newest row, so a
+   *     queue that is still being appended to is never adopted; and
+   *   - a healthy-active-lock check, so a queue with a running child is skipped
+   *     even if it is old.
+   *
+   * Returns true when rows were stamped.
+   */
+  async adoptLegacyPrivateQueue(
+    queueName: string,
+    minAgeMs = LEGACY_PRIVATE_QUEUE_ADOPTION_MIN_AGE_MS,
+  ): Promise<boolean> {
+    if (!isDreamInlinePrivateQueue(queueName)) {
+      throw new Error(`refusing to adopt non-private queue '${queueName}'`);
+    }
+    const rows = await this.engine.executeRaw<{ id: number }>(
+      `WITH q AS (
+         SELECT * FROM minion_jobs
+          WHERE queue = $1
+            AND status = ANY($2::text[])
+       ),
+       gate AS (
+         SELECT
+           count(*) FILTER (
+             WHERE private_queue_owner_job_id IS NOT NULL
+                OR private_queue_owner_token IS NOT NULL
+                OR private_queue_lease_until IS NOT NULL
+           ) AS owned_rows,
+           count(*) FILTER (WHERE status = 'active' AND lock_until > now()) AS active_healthy,
+           max(COALESCE(updated_at, created_at)) AS newest_at,
+           count(*) AS total_rows
+           FROM q
+       )
+       UPDATE minion_jobs m
+          SET private_queue_owner_token = $3,
+              private_queue_lease_until = now() + ($4::text::interval),
+              updated_at = now()
+         FROM gate
+        WHERE m.queue = $1
+          AND m.status = ANY($2::text[])
+          AND gate.total_rows > 0
+          AND gate.owned_rows = 0
+          AND gate.active_healthy = 0
+          AND gate.newest_at < now() - ($5::text::interval)
+        RETURNING m.id`,
+      [
+        queueName,
+        NON_TERMINAL_STATUSES,
+        `legacy-adopted-${randomUUID()}`,
+        `${Math.max(1, Math.floor(DEFAULT_PRIVATE_QUEUE_LEASE_MS))} milliseconds`,
+        `${Math.max(1, Math.floor(minAgeMs))} milliseconds`,
+      ],
+    );
+    return rows.length > 0;
+  }
+
   private async classifyPrivateQueueForRecovery(
     queueName: string,
   ): Promise<'orphan' | 'live' | 'unowned' | 'not_orphan'> {
@@ -873,6 +981,9 @@ export class MinionQueue {
       nonterminal_owner_rows: string | number;
       max_lease_until: string | null;
       future_lease_rows: string | number;
+      owner_host: string | null;
+      owner_pid: number | null;
+      owner_age_ms: string | number | null;
     }>(
       `WITH q AS (
          SELECT *
@@ -897,7 +1008,10 @@ export class MinionQueue {
          (SELECT count(*) FROM owners WHERE status = 'active' AND lock_until > now()) AS live_owner_rows,
          (SELECT count(*) FROM owners WHERE status IN ('waiting','active','delayed','waiting-children','paused')) AS nonterminal_owner_rows,
          max(q.private_queue_lease_until)::text AS max_lease_until,
-         count(*) FILTER (WHERE q.private_queue_lease_until > now()) AS future_lease_rows
+         count(*) FILTER (WHERE q.private_queue_lease_until > now()) AS future_lease_rows,
+         min(q.private_queue_owner_host) AS owner_host,
+         min(q.private_queue_owner_pid) AS owner_pid,
+         EXTRACT(EPOCH FROM (now() - min(q.created_at))) * 1000 AS owner_age_ms
        FROM q`,
       [queueName, NON_TERMINAL_STATUSES],
     );
@@ -914,7 +1028,27 @@ export class MinionQueue {
     if (ownerTerminal) return 'orphan';
     if (Number(r.future_lease_rows ?? 0) > 0) return 'live';
     const leaseExpired = r.max_lease_until !== null && new Date(r.max_lease_until).getTime() <= Date.now();
-    return leaseExpired ? 'orphan' : 'not_orphan';
+    if (!leaseExpired) return 'not_orphan';
+
+    // Lease lapsed — NOT sufficient on its own. The lease only renews while a
+    // child handler is executing (inline-drain's 60s keepalive), so a long
+    // gap between children, or a slow post-drain collection, can lapse the
+    // lease under a perfectly healthy owner. Probe the recorded process
+    // before cancelling: alive/cross-host/unknown all mean HANDS OFF, and a
+    // provably-dead PID must still age past the reuse grace.
+    const ownerHost = r.owner_host;
+    const ownerPid = r.owner_pid == null ? null : Number(r.owner_pid);
+    if (ownerHost && ownerPid != null && Number.isFinite(ownerPid) && ownerPid > 0) {
+      const ageMs = Number(r.owner_age_ms ?? 0);
+      const liveness = classifyHolderLiveness(ownerPid, ownerHost, Number.isFinite(ageMs) ? ageMs : 0);
+      // Only a same-host, provably-dead, past-grace owner may be reclaimed.
+      return liveness === 'dead_eligible' ? 'orphan' : 'live';
+    }
+
+    // Metadata-backed but no probe-able process identity (rows written by an
+    // older build of this same feature). Expired lease is all we have; keep
+    // the prior behaviour rather than inventing a stronger claim.
+    return 'orphan';
   }
 
   /**
