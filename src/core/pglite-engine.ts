@@ -1138,7 +1138,13 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='timeout_at') AS minion_jobs_timeout_at_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='idempotency_key') AS minion_jobs_idempotency_key_exists
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='idempotency_key') AS minion_jobs_idempotency_key_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='private_queue_owner_job_id') AS minion_jobs_pq_owner_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='private_queue_owner_token') AS minion_jobs_pq_token_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='private_queue_lease_until') AS minion_jobs_pq_lease_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -1188,6 +1194,9 @@ export class PGLiteEngine implements BrainEngine {
       minion_jobs_exists: boolean;
       minion_jobs_timeout_at_exists: boolean;
       minion_jobs_idempotency_key_exists: boolean;
+      minion_jobs_pq_owner_exists: boolean;
+      minion_jobs_pq_token_exists: boolean;
+      minion_jobs_pq_lease_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -1279,6 +1288,9 @@ export class PGLiteEngine implements BrainEngine {
     // exactly like the v121 incident.
     const needsMinionJobsTimeoutAt = probe.minion_jobs_exists && !probe.minion_jobs_timeout_at_exists;
     const needsMinionJobsIdempotencyKey = probe.minion_jobs_exists && !probe.minion_jobs_idempotency_key_exists;
+    const needsMinionJobsPrivateQueue = probe.minion_jobs_exists
+      && (!probe.minion_jobs_pq_owner_exists || !probe.minion_jobs_pq_token_exists
+          || !probe.minion_jobs_pq_lease_exists);
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -1293,7 +1305,8 @@ export class PGLiteEngine implements BrainEngine {
         && !needsPagesEmbeddingSignature
         && !needsPagesLinksExtractedAt
         && !needsTimelineEventPageId
-        && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey) return;
+        && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey
+        && !needsMinionJobsPrivateQueue) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -1572,6 +1585,15 @@ export class PGLiteEngine implements BrainEngine {
       // v7: blob index uniq_minion_jobs_idempotency references idempotency_key.
       await this.db.exec(`
         ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+      `);
+    }
+    if (needsMinionJobsPrivateQueue) {
+      // v136: schema-blob indexes reference these columns before migrations
+      // run on an old brain; add the full lifecycle shape before replay.
+      await this.db.exec(`
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS private_queue_owner_job_id INTEGER REFERENCES minion_jobs(id) ON DELETE SET NULL;
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS private_queue_owner_token TEXT;
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS private_queue_lease_until TIMESTAMPTZ;
       `);
     }
   }

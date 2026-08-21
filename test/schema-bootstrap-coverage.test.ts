@@ -183,6 +183,9 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // wedges the blob replay exactly like the v121 incident.
   { kind: 'column', table: 'minion_jobs', column: 'timeout_at' },
   { kind: 'column', table: 'minion_jobs', column: 'idempotency_key' },
+  { kind: 'column', table: 'minion_jobs', column: 'private_queue_owner_job_id' },
+  { kind: 'column', table: 'minion_jobs', column: 'private_queue_owner_token' },
+  { kind: 'column', table: 'minion_jobs', column: 'private_queue_lease_until' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -284,6 +287,12 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       DROP INDEX IF EXISTS uniq_minion_jobs_idempotency;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS timeout_at;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS idempotency_key;
+
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_recovery;
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_owner;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_job_id;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_token;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_lease_until;
     `);
 
     // Note: we don't strip sources.archived* here because they're inline in the
@@ -377,6 +386,12 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       DROP INDEX IF EXISTS uniq_minion_jobs_idempotency;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS timeout_at;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS idempotency_key;
+
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_recovery;
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_owner;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_job_id;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_token;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_lease_until;
 
       -- WP4 (v127) strip: surface columns + the wedge-signal index; replay
       -- must succeed from the pre-v127 shape.
