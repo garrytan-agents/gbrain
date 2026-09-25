@@ -1,15 +1,16 @@
-import { afterAll, beforeAll, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, expect, mock, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as imageImport from '../src/core/import-file.ts';
 import * as realEmbedding from '../src/core/embedding.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { interruptAfterSyncDiscovery } from './helpers/persistence-sync-interruption.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
-import { freezeSyncContent, thawSyncContent } from '../src/core/persistence/sync-content.ts';
+import { freezeSyncContent, thawSyncContent, MAX_SYNC_BYTES } from '../src/core/persistence/sync-content.ts';
 import { digest, sha256 } from '../src/core/persistence/digest.ts';
 
 let lastInputs: unknown[] = [];
@@ -21,7 +22,7 @@ const { performManagedSync } = await import('../src/core/persistence/sync-run.ts
 const { disposePersistenceConsumer } = await import('../src/core/persistence/service.ts');
 const { claimWorktree, getWorktreeBinding, acquireWorktree } = await import('../src/core/persistence/ownership.ts');
 const { prepareManagedSyncMutation } = await import('../src/core/persistence/sync-prepare.ts');
-const { discoverManagedSync, readSyncBytes } = await import('../src/core/persistence/sync-discovery.ts');
+const { discoverManagedSync, readSyncBytes, readSyncFile } = await import('../src/core/persistence/sync-discovery.ts');
 const home = mkdtempSync(join(tmpdir(), 'managed-sync-images-'));
 const env = { GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_EMBEDDING_MULTIMODAL: 'true', GBRAIN_EMBEDDING_IMAGE_OCR: 'false' };
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
@@ -284,6 +285,73 @@ check('explicit idle retry upgrades a legacy unknown-consent cursor without rewr
   expect(await engine.getPage('photo.png', { sourceId: f.id })).toMatchObject({ type: 'image' });
   expect(await engine.executeRaw("SELECT fingerprint FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1", [legacy])).toEqual([]);
 });
+check('pinned Git binary reads accept exactly 10 MiB and refuse limit plus one', async () => {
+  const bytes = Buffer.alloc(MAX_SYNC_BYTES, 0xa5), oversized = Buffer.concat([bytes, Buffer.from([0xff])]);
+  const f = await fixture({ 'limit.png': bytes, 'overflow.png': oversized });
+  const discovery = await discoverManagedSync(engine, f.opts);
+  const limit = discovery.entries.find(e => e.path === 'limit.png')!;
+  // A later working-tree edit is not the accepted blob.
+  writeFileSync(join(f.root, 'limit.png'), oversized);
+  expect(readSyncBytes(discovery, limit)).toEqual(bytes);
+  expect(() => readSyncBytes(discovery, discovery.entries.find(e => e.path === 'overflow.png')!)).toThrow('bounded import size');
+  expect(await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1', [f.id])).toEqual([]);
+  expect(await anchor(f.id)).toBeNull();
+});
+check('working-tree binary admission retains exact 10 MiB, confinement, regular-file and symlink guards', async () => {
+  const f = await fixture({ 'photo.png': Buffer.from([0, 255, 128]) });
+  const discovery = await discoverManagedSync(engine, f.opts), entry = { ...discovery.entries[0], working: true };
+  const bytes = Buffer.alloc(MAX_SYNC_BYTES, 0xa5);
+  writeFileSync(join(f.root, 'photo.png'), bytes);
+  expect(readSyncBytes(discovery, entry)).toEqual(bytes);
+  writeFileSync(join(f.root, 'photo.png'), Buffer.concat([bytes, Buffer.from([0xff])]));
+  expect(() => readSyncBytes(discovery, entry)).toThrow('bounded import size');
+  mkdirSync(join(f.root, 'directory.png'));
+  expect(() => readSyncFile(f.root, 'directory.png')).toThrow('regular file');
+  symlinkSync('photo.png', join(f.root, 'alias.png'));
+  expect(() => readSyncFile(f.root, 'alias.png')).toThrow('symlink');
+  symlinkSync('.', join(f.root, 'linked'));
+  expect(() => readSyncFile(f.root, 'linked/photo.png')).toThrow('symlink');
+  expect(() => readSyncFile(f.root, '../outside.png')).toThrow('escaped');
+  expect(await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1', [f.id])).toEqual([]);
+});
+test('frozen binary decoding accepts exactly 10 MiB and refuses limit plus one with canonical digest', () => {
+  const bytes = Buffer.alloc(MAX_SYNC_BYTES, 0xa5), overflow = Buffer.concat([bytes, Buffer.from([0xff])]);
+  const frozen = freezeSyncContent('photo.png', bytes);
+  expect(thawSyncContent('photo.png', frozen.content, frozen.contentEncoding, frozen.contentHash)).toEqual(bytes);
+  expect(() => freezeSyncContent('photo.png', overflow)).toThrow('bounded import size');
+  expect(() => thawSyncContent('photo.png', overflow.toString('base64'), 'base64', sha256(overflow))).toThrow('not canonically encoded');
+  expect(() => thawSyncContent('photo.png', frozen.content, 'base64', sha256(overflow))).toThrow('digest');
+  expect(() => thawSyncContent('photo.png', frozen.content + '\n', 'base64', frozen.contentHash)).toThrow();
+});
+check('invalid frozen image admission never reaches importer, provider or canonical apply', async () => {
+  const f = await fixture({ 'photo.png': Buffer.from('---\nslug: photo.png\n---\nSynthetic UTF-8-like image bytes.\n') });
+  const lock = await acquireWorktree((await getWorktreeBinding(engine, f.id))!);
+  expect(lock).not.toBeNull();
+  try {
+    await performManagedSync(engine, f.opts); await disposePersistenceConsumer(engine);
+    const [row] = await engine.executeRaw<import('../src/core/persistence/model.ts').WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1', [f.id]);
+    const overflow = Buffer.alloc(MAX_SYNC_BYTES + 1, 0x61);
+    let importerCalls = 0, applyCalls = 0;
+    const before = calls;
+    const importer = spyOn(imageImport, 'importImageFile').mockImplementation(async () => { importerCalls++; throw new Error('Importer must not run'); });
+    try {
+      for (const invalid of [
+        { binaryContent: overflow.toString('base64'), contentHash: sha256(overflow) },
+        { contentEncoding: 'utf8' }, { contentHash: 'wrong' }, { binaryContent: '!!!!' },
+        { content: 'Synthetic text-like image payload' },
+      ]) {
+        await expect((async () => {
+          const prepared = await prepareManagedSyncMutation(engine, { ...row, intent: { ...row.intent, ...invalid } }, { engine: 'pglite' });
+          applyCalls++; await prepared.apply(engine);
+        })()).rejects.toBeDefined();
+      }
+      expect(importerCalls).toBe(0); expect(calls).toBe(before); expect(applyCalls).toBe(0);
+      expect(await engine.getPage('photo.png', { sourceId: f.id })).toBeNull();
+      expect(await anchor(f.id)).toBeNull();
+    } finally { importer.mockRestore(); }
+  } finally { await lock?.release(); await disposePersistenceConsumer(engine); }
+});
+
 check('source incarnation, topology and current writer authority still fence prepared images', async () => {
   for (const race of ['topology', 'incarnation', 'authority']) {
     const f = await fixture({ 'photo.png': png });
