@@ -224,11 +224,13 @@ describe('resolveFanoutMax', () => {
 describe('dispatchPerSource — integration with stubbed engine + queue', () => {
   type AddedJob = { name: string; data: unknown; opts: Record<string, unknown> };
 
-  function makeStubs(sources: SourceRow[], opts?: { listThrows?: boolean }) {
+  function makeStubs(sources: SourceRow[], opts?: { listThrows?: boolean; enabled?: boolean; claimed?: string[] }) {
     const added: AddedJob[] = [];
     let nextId = 100;
     const engine = {
       kind: 'postgres' as const,
+      executeRaw: async (sql: string, params?: unknown[]) => sql.includes('FROM persistence_brain') ? [{ enabled: opts?.enabled === true }]
+        : sql.includes('FROM persistence_source_bindings') && opts?.claimed?.includes(String(params?.[0])) ? [{ source_id: params?.[0] }] : [],
       listAllSources: async () => {
         if (opts?.listThrows) throw new Error('sources table missing');
         return sources;
@@ -254,6 +256,15 @@ describe('dispatchPerSource — integration with stubbed engine + queue', () => 
     };
     return { engine, queue, added, events, logs, fanoutOpts };
   }
+
+  test('automatic managed fanout disables pull without skipping sync or treating immutable as archived', async () => {
+    for (const enabled of [false, true]) {
+      const config = { remote_url: 'https://example.invalid/repository.git', immutable: true, managed_clone: true, federated: false };
+      const { engine, queue, added, fanoutOpts } = makeStubs([src('managed', undefined, config)], { enabled, claimed: ['managed'] });
+      expect((await dispatchPerSource(engine, queue, fanoutOpts)).dispatched).toEqual(['managed']);
+      expect(added[0].data).toMatchObject({ source_id: 'managed', pull: false, phases: SOURCE_FRESHNESS_PHASES });
+    }
+  });
 
   test('empty sources list falls back to legacy single-job dispatch', async () => {
     const { engine, queue, added, fanoutOpts } = makeStubs([]);
