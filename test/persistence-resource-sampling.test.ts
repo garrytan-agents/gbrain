@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { constants } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -50,10 +50,12 @@ test('RSS sampling refuses invalid measurements instead of fabricating or skippi
     expect(calls).toBe(1);
   }
 });
-test('both owner observations use the bounded sampler and reproducibility includes its source', () => {
-  const root = join(import.meta.dir, '..');
-  const worker = readFileSync(join(root, 'scripts/persistence/worker.ts'), 'utf8');
-  expect(worker.match(/\breadResidentBytes\(\)/g)).toHaveLength(2);
-  expect(worker).not.toContain('process.memoryUsage()');
-  expect(readFileSync(join(root, 'scripts/persistence/validate.ts'), 'utf8')).toContain("'scripts/persistence/resource-sampling.ts'");
+describe('RSS sampler wiring', () => {
+  test('both owner observations use the bounded sampler and reproducibility includes its source', () => {
+    const root = join(import.meta.dir, '..');
+    const worker = readFileSync(join(root, 'scripts/persistence/worker.ts'), 'utf8');
+    expect(worker.match(/\breadResidentBytes\(\)/g)).toHaveLength(2);
+    expect(worker).not.toContain('process.memoryUsage()');
+    expect(readFileSync(join(root, 'scripts/persistence/validate.ts'), 'utf8')).toContain("'scripts/persistence/resource-sampling.ts'");
+  });
 });
